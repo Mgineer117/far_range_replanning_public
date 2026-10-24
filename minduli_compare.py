@@ -150,10 +150,14 @@ def policy_action(policy, obs, ctx, stochastic):
 
 
 def episode_fixed(policy, start, t0, stochastic=False, constant=None, error=None, seed=0,
-                  start_after_burn=True, enforce_limit=False, ctx=None):
+                  start_after_burn=True, enforce_limit=False, ctx=None, reference=None):
+    # The guidance law is identical; only its reference state/impulses change.
+    ref_start, ref_times, ref_burns = ((m.START, NOM_TIMES, NOM_BURNS)
+                                        if reference is None else reference)
     rng = np.random.default_rng(seed)
     nodes = np.r_[t0, np.arange(np.floor(t0/540)+1, 41)*540.]
-    nodes = np.unique(np.clip(nodes, t0, m.TOF))
+    # Feedforward burns must be applied at the selected reference's own nodes.
+    nodes = np.unique(np.clip(np.r_[nodes, ref_times[ref_times >= t0]], t0, m.TOF))
     x = m.to_eci(start, t0)
     fuel = 0.
     pws, pas = np.inf, np.inf
@@ -163,16 +167,17 @@ def episode_fixed(policy, start, t0, stochastic=False, constant=None, error=None
     infeasible = 0
     impulse_limit_violations = 0
     for j, (t, nxt) in enumerate(zip(nodes[:-1], nodes[1:])):
-        burn_id = np.flatnonzero(np.isclose(NOM_TIMES, t, atol=1e-5))
-        nominal_burn = NOM_BURNS[burn_id[0]] if len(burn_id) else np.zeros(3)
-        nominal_post = m.trajectory(m.START, NOM_TIMES, NOM_BURNS, np.array([t]))[0]
-        if len(burn_id) and t == t0 and start_after_burn:
+        burn_id = np.flatnonzero(np.isclose(ref_times, t, atol=1e-5, rtol=0))
+        nominal_burn = ref_burns[burn_id[0]] if len(burn_id) else np.zeros(3)
+        nominal_post = m.trajectory(ref_start, ref_times, ref_burns, np.array([t]))[0]
+        if reference is None and len(burn_id) and t == t0 and start_after_burn:
             # Disturbance states are sampled after any burn at their nominal point.
             nominal_burn = np.zeros(3)
         x = x.copy()
         x[3:] += nominal_burn
         current = m.to_rel(x, t)
-        obs = observation(current, nominal_post, t, len(nodes)-j-1, prev_reward, prev_alpha)
+        remaining = np.count_nonzero(np.arange(540., m.TOF+1, 540.) > t)
+        obs = observation(current, nominal_post, t, remaining, prev_reward, prev_alpha)
         step_ctx = np.zeros(48, np.float32) if ctx is None else ctx
         raw, logp, value = policy_action(policy, obs, step_ctx, stochastic)
         alpha = 0. if j == len(nodes)-2 else (constant if constant is not None else np.clip(raw[0]+1, 0, 2))
@@ -197,10 +202,10 @@ def episode_fixed(policy, start, t0, stochastic=False, constant=None, error=None
         next_rel = m.to_rel(x_next, nxt)
         range_next = np.linalg.norm(next_rel[:3])
         safety = 1000*max(0, m.KOZ-range_next, m.KOZ-local_pas)
-        nominal_pre = m.trajectory(m.START, NOM_TIMES, NOM_BURNS, np.array([nxt]))[0]
-        next_burn = np.flatnonzero(np.isclose(NOM_TIMES, nxt, atol=1e-5))
+        nominal_pre = m.trajectory(ref_start, ref_times, ref_burns, np.array([nxt]))[0]
+        next_burn = np.flatnonzero(np.isclose(ref_times, nxt, atol=1e-5, rtol=0))
         if len(next_burn):
-            nominal_pre[3:] -= m.target(nxt)[1].T @ NOM_BURNS[next_burn[0]]
+            nominal_pre[3:] -= m.target(nxt)[1].T @ ref_burns[next_burn[0]]
         # Eq. (12) observability at the next node, compared to nominal.
         free_rel = m.to_rel(m.propagate(x-np.r_[np.zeros(3), executed], nxt-t), nxt)
         nom_free = m.to_rel(m.propagate(m.to_eci(nominal_post, t)-np.r_[np.zeros(3), nominal_burn], nxt-t), nxt)
@@ -215,7 +220,7 @@ def episode_fixed(policy, start, t0, stochastic=False, constant=None, error=None
         prev_reward, prev_alpha = reward, alpha
         x = x_next
     # Final nominal burn at arrival, matching the paper's six-impulse schedule.
-    final_command = NOM_BURNS[-1]
+    final_command = ref_burns[-1]
     x[3:] += execute_error(final_command, m.TOF, rng, error)
     fuel += np.linalg.norm(final_command)
     final = m.to_rel(x, m.TOF)
@@ -296,10 +301,11 @@ def covariance_sigma(trace):
     sensor = np.eye(3)*1e-6
     ident = np.eye(6)
     last_t = trace[0][0]
+    measurements = np.r_[np.arange(last_t+10, trace[-1][1]-1e-6, 10.), trace[-1][1]]
     for t, nxt, x in trace:
-        sample_times = np.arange(max(t+10, last_t+10), nxt+1e-6, 10.)
-        if not len(sample_times) or sample_times[-1] < nxt-1e-6:
-            sample_times = np.r_[sample_times, nxt]
+        sample_times = measurements[(measurements > t+1e-6) & (measurements <= nxt+1e-6)]
+        if not len(sample_times):
+            continue
         states = m.to_rel(m.propagate(x, sample_times-t), sample_times)
         for ts, state in zip(sample_times, states):
             dt = ts-last_t
@@ -482,62 +488,10 @@ def train(data, train_ids, validation_ids, out, args):
               args.episodes, 9, out/'latent_ppo.pt')
 
 
-def evaluate(data, test, out):
-    fixed = FixedPolicy()
-    fixed.load_state_dict(torch.load(out/'fixed_ppo.pt', weights_only=True))
-    planner = ReplanPolicy()
-    planner.load_state_dict(torch.load(out/'latent_ppo.pt', weights_only=True))
-    fixed.eval()
-    planner.eval()
-    output = {}
-    fixed_rows = [episode_fixed(fixed, data['starts'][i],
-                  m.GRID[int(data['indices'][i])])[1] for i in test]
-    direct_rows = [episode_replan(planner, data, int(i))[1] for i in test]
-    output['FRG'] = summarize(fixed_rows)
-    output['DLR'] = summarize(direct_rows)
-    selected, accepted, costs = [], 0, []
-    nominal_covariance = {}
-    for i in test:
-        i = int(i)
-        _, learned, trace = episode_replan(planner, data, i)
-        start, times = data['starts'][i], data['replan_times'][i]
-        t0 = float(times[0])
-        nominal = m.trajectory(m.START, NOM_TIMES, NOM_BURNS, np.array([t0]))[0]
-        obs = observation(start, nominal, t0, (m.TOF-t0)/540)
-        raw, _, _ = policy_action(planner, obs, context(start, None, t0), False)
-        first_four = np.clip(minimum_norm_seed(start, times)[:4] +
-                             10*np.tanh(raw).reshape(4, 3), -10, 10)
-        burns, _ = m.complete_last_two(start, times, first_four)
-        pws, pas = m.validated_safety(start, times, burns[0])
-        learned['pws_m'], learned['pas_m'] = pws, pas
-        valid = (learned['position_m'] < 1 and learned['velocity_m_s'] < .01 and
-                 pws >= m.KOZ and pas >= m.KOZ and
-                 learned['burn_limit_violation_m_s'] < 1e-6)
-        if valid:
-            if t0 not in nominal_covariance:
-                nominal_covariance[t0] = covariance_sigma(nominal_trace_from(t0))
-            valid = covariance_sigma(trace) <= nominal_covariance[t0]
-        if valid:
-            selected.append(learned)
-            accepted += 1
-            costs.append((m.score(start, times, first_four[None], 50)[0][0],
-                          m.score(start, times, data['replan_burns'][i,:4][None], 50)[0][0]))
-        else:
-            terminal = data['replan_paths'][data['replan_offsets'][i+1]-1]
-            selected.append({'fuel_m_s': float(np.linalg.norm(data['replan_burns'][i], axis=1).sum()),
-                             'position_m': float(np.linalg.norm(terminal[:3]-m.GOAL[:3])),
-                             'velocity_m_s': float(np.linalg.norm(terminal[3:]-m.GOAL[3:])),
-                             'pws_m': float(data['replan_metrics'][i, 1]),
-                             'pas_m': float(data['replan_metrics'][i, 2])})
-    keys = ('fuel_m_s', 'position_m', 'velocity_m_s', 'pws_m', 'pas_m')
-    output['VLRR'] = summarize([{key: row[key] for key in keys} for row in selected])
-    output['VLRR']['accepted_learned'] = accepted
-    output['VLRR']['stored_pso_fallback'] = len(test)-accepted
-    if costs:
-        output['VLRR']['accepted_learned_objective_mean'] = float(np.mean(costs, axis=0)[0])
-        output['VLRR']['same_case_pso_objective_mean'] = float(np.mean(costs, axis=0)[1])
-    (out/'comparison.json').write_text(json.dumps(output, indent=2))
-    print(json.dumps(output, indent=2))
+def evaluate(data, test, out, planning_delay_s=60., replanner_iterations=30):
+    """Run FRG and the three learned recovery variants on identical cases."""
+    from minduli_fourway import run
+    return run(data, test, out, planning_delay_s, replanner_iterations)
 
 
 def main():
@@ -550,9 +504,16 @@ def main():
     parser.add_argument('--paper-updates', type=int, default=80)
     parser.add_argument('--episodes', type=int, default=20)
     parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--cases', type=int, help='Evenly sample this many held-out cases; default: all 200')
+    parser.add_argument('--planning-delay-s', type=float, default=60.,
+                        help='Assumed SCvx arrival budget in simulation seconds, not flight-hardware timing')
+    parser.add_argument('--replanner-iterations', type=int, default=30)
     args = parser.parse_args()
     if args.self_check:
         self_check()
+        from minduli_fourway import self_check as fourway_check
+        with np.load(args.data) as saved:
+            fourway_check({key: saved[key] for key in saved.files})
         return
     args.output.mkdir(parents=True, exist_ok=True)
     with np.load(args.data) as file:
@@ -563,9 +524,15 @@ def main():
     train_ids = np.flatnonzero((groups%5 != 0)&(groups%10 != 1))
     validation_ids = np.flatnonzero(groups%10 == 1)
     test = np.flatnonzero(groups%5 == 0)
+    if args.cases is not None:
+        if not 1 <= args.cases <= len(test):
+            parser.error('--cases must be between 1 and the held-out case count')
+        test = test[np.linspace(0, len(test)-1, args.cases, dtype=int)]
+    if args.replanner_iterations < 1:
+        parser.error('--replanner-iterations must be positive')
     if args.train:
         train(data, train_ids, validation_ids, args.output, args)
-    evaluate(data, test, args.output)
+    evaluate(data, test, args.output, args.planning_delay_s, args.replanner_iterations)
 
 
 if __name__ == '__main__':

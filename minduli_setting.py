@@ -14,23 +14,40 @@ from pathlib import Path
 import numpy as np
 
 
+# Earth's gravitational parameter, G * Earth mass [m^3/s^2].
 MU = 3.986004418e14
+# Target's circular orbital radius: Earth radius + 300 km altitude [m].
 R = 6_378_136.0 + 300_000.0
+# Target's mean motion (orbital angular rate); orbital period = 2*pi/N [rad/s].
 N = np.sqrt(MU / R**3)
+# Nominal transfer time of flight: six hours [s].
 TOF = 21_600.0
+# Radius of the spherical keep-out zone centered on the target [m].
 KOZ = 500.0
+# Chaser states relative to the target in its rotating RTN frame:
+# [radial, along-track, cross-track position (m), corresponding velocities (m/s)].
+# Arrival is 1 km along-track, with zero velocity in the rotating frame.
 GOAL = np.array([0.0, 1000.0, 0.0, 0.0, 0.0, 0.0])
+# Nominal initial state, approximately 100 km along-track from the target.
 START = np.array([1.0, 100_000.0, 5.0, -0.02, 0.01, 0.0])
+# Six nominal ECI-frame [x, y, z] velocity impulses from paper Table 3 [m/s].
+# nominal() recomputes the final two burns to correct table rounding.
 TABLE_BURNS = np.array([
     [-0.3222, -0.0691, 0.3964], [0.0, 0.0, 0.0],
     [-0.7197, 0.0313, -0.1560], [0.2889, -0.0495, 0.2627],
     [-0.0488, 0.5096, -2.9538], [-0.2966, 0.0456, -0.2554],
 ])
+# Target orbit inclination, converted from degrees to radians.
 INC = np.deg2rad(99.8)
+# Fixed ECI unit vector along the ascending node; also target radial at t=0.
 P = np.array([1.0, 0.0, 0.0])
+# Fixed in-plane ECI unit vector 90 degrees ahead of P; target along-track at t=0.
 Q = np.array([0.0, np.cos(INC), np.sin(INC)])
+# Fixed unit orbit normal (angular momentum direction), completing the basis.
 H = np.cross(P, Q)
+# 1,000 sample times over the nominal transfer, including both endpoints [s].
 GRID = np.linspace(0, TOF, 1000)
+# Directory containing this script, used to locate data and result files.
 HERE = Path(__file__).resolve().parent
 
 
@@ -237,20 +254,43 @@ def pso(start, t0, seed, particles=16, iterations=20, points=12, warm=None):
     return times, burns[0], float(value[0]), float(pws[0]), float(pas[0])
 
 
+def minimum_separation(eci, t, duration):
+    """Refine closest approaches on one unforced coast; not a formal certificate."""
+    from scipy.optimize import brentq
+
+    if not np.isfinite(duration) or duration < 0:
+        raise ValueError('Coast duration must be finite and nonnegative')
+    grid = np.linspace(0, duration, max(2, int(np.ceil(duration/10))+1))
+    states = to_rel(propagate(eci, grid), t+grid)
+    rate = np.einsum('ij,ij->i', states[:, :3], states[:, 3:])
+    distances = np.linalg.norm(states[:, :3], axis=1)
+    if not np.all(np.isfinite(states)):
+        raise ValueError('Nonfinite coast state')
+    minimum = float(distances.min())
+
+    def radial_rate(dt):
+        state = to_rel(propagate(eci, dt), t+dt)
+        return float(np.dot(state[:3], state[3:]))
+
+    for j in np.flatnonzero((rate[:-1] < 0) & (rate[1:] > 0)):
+        dt = brentq(radial_rate, grid[j], grid[j+1], xtol=1e-5)
+        state = to_rel(propagate(eci, dt), t+dt)
+        minimum = min(minimum, float(np.linalg.norm(state[:3])))
+    return minimum
+
+
 def validated_safety(start, times, burns):
-    sample_times = np.linspace(times[0], times[-1], max(1000, int((times[-1]-times[0])/10)))
-    path = trajectory(start, times, burns, sample_times)
-    pws = float(np.linalg.norm(path[:, :3], axis=1).min())
+    """Refine PWS and missed-burn passive closest approaches on each coast."""
     x = to_eci(start, times[0])
-    pas = np.inf
+    pws, pas = np.inf, np.inf
     for j, t in enumerate(times):
-        probe = t + np.linspace(0, 5400, 120)
-        ballistic = to_rel(propagate(x, probe-t), probe)
-        pas = min(pas, np.linalg.norm(ballistic[:, :3], axis=1).min())
+        pas = min(pas, minimum_separation(x, t, 5400))
         x = x.copy()
         x[3:] += burns[j]
         if j < 5:
-            x = propagate(x, times[j+1]-t)
+            dt = times[j+1]-t
+            pws = min(pws, minimum_separation(x, t, dt))
+            x = propagate(x, dt)
     return pws, pas
 
 
@@ -335,6 +375,14 @@ def self_check():
     times, burns, path = nominal()
     assert np.linalg.norm(path[-1]-GOAL) < 1e-3
     assert abs(np.linalg.norm(burns, axis=1).sum()-5.0381) < .01
+    # Regression: all coarse samples pass although the coast enters the KOZ.
+    mid = 4.25
+    near_target = np.array([497.4, 0., 0., 0., 30., 0.])
+    coast = propagate(to_eci(near_target, mid), -mid)
+    coarse_times = np.linspace(0, 17., 3)
+    coarse = to_rel(propagate(coast, coarse_times), coarse_times)
+    assert np.linalg.norm(coarse[:, :3], axis=1).min() > KOZ
+    assert abs(minimum_separation(coast, 0., 17.)-497.4) < 1e-3
     print(json.dumps({'nominal_fuel_m_s': float(np.linalg.norm(burns, axis=1).sum()),
                       'nominal_terminal_error_m': float(np.linalg.norm(path[-1, :3]-GOAL[:3])),
                       'nominal_min_pws_m': float(np.linalg.norm(path[:, :3], axis=1).min())}, indent=2))
