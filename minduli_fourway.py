@@ -33,10 +33,10 @@ def execute(start, t0, times, burns, stop=None):
     return x, trace, passive
 
 
-def fixed_plan(fixed, start, t0, c, reference=None, start_after_burn=True):
+def fixed_plan(fixed, start, t0, c, reference=None, start_after_burn=True, estimator=None):
     """Execute the same alpha/QCQP guidance against any selected reference."""
     _, _, trace = c.episode_fixed(fixed, start, t0, reference=reference,
-                                 start_after_burn=start_after_burn)
+                                 start_after_burn=start_after_burn, estimator=estimator)
     x = m.to_eci(start, t0)
     times, burns = [], []
     for t, nxt, after in trace:
@@ -76,6 +76,14 @@ def assess(start, t0, times, burns, sigma_limit, c):
         result['position_m'] < 1 and result['velocity_m_s'] < .01 and
         min(pws, pas) >= m.KOZ and result['max_burn_component_m_s'] <= 10+1e-7)
     result['feasible'] = bool(result['physical_feasible'] and sigma <= sigma_limit+1e-6)
+    failed = []
+    if not result['position_m'] < 1: failed.append('terminal_position')
+    if not result['velocity_m_s'] < .01: failed.append('terminal_velocity')
+    if not pws >= m.KOZ: failed.append('path_separation')
+    if not pas >= m.KOZ: failed.append('passive_separation')
+    if not result['max_burn_component_m_s'] <= 10+1e-7: failed.append('burn_limit')
+    if not sigma <= sigma_limit+1e-6: failed.append('covariance')
+    result['failed_checks'] = failed
     return result
 
 
@@ -97,7 +105,7 @@ def improvement_check(candidate, baseline):
             'fuel_improved': fuel_improved, 'fuel_saving_m_s': saving}
 
 
-def handoff_plan(start, t0, base, delay, iterations, sigma_limit, c, fixed):
+def handoff_plan(start, t0, base, delay, iterations, sigma_limit, c, fixed, start_est=None, base_pred=None):
     """Plan for a predicted handoff while the selected bridge is executed.
 
     shortcut: ideal dynamics make predicted and executed handoff states identical;
@@ -106,14 +114,26 @@ def handoff_plan(start, t0, base, delay, iterations, sigma_limit, c, fixed):
     from minduli_scvx import scvx
 
     stop = t0+delay
+    # x, _, _ = execute(start, t0, *base, stop=stop)
+    # predicted = m.to_rel(x, stop)
     x, _, _ = execute(start, t0, *base, stop=stop)
-    predicted = m.to_rel(x, stop)
+    true_state = m.to_rel(x, stop)                      # where the chaser really is at the handoff
+    if start_est is None:
+        predicted = true_state
+    else:
+        x_est, _, _ = execute(start_est, t0, *base, stop=stop)
+        predicted = m.to_rel(x_est, stop)               # where the system believes it is
+    handoff_err = predicted - true_state
+    estimator = lambda t, current: current + handoff_err if abs(t - stop) < 1e-6 else current
+    est0 = start if start_est is None else start_est      # the system's believed state at t0
+    base_pred = base if base_pred is None else base_pred
     times = np.linspace(stop, m.TOF, 6)
     warm = c.minimum_norm_seed(predicted, times)
     times, burns, status = scvx(predicted, stop, warm=warm, iterations=iterations,
                                 objective='fuel')
     reference = (predicted, times, burns)
-    continuation = fixed_plan(fixed, predicted, stop, c, reference=reference)
+    continuation = fixed_plan(fixed, true_state, stop, c, reference=reference, estimator=estimator)
+    
     prefix = base[0] < stop-1e-8
     def with_prefix(plan):
         return (np.r_[base[0][prefix], plan[0]], np.vstack((base[1][prefix], plan[1])))
@@ -121,18 +141,29 @@ def handoff_plan(start, t0, base, delay, iterations, sigma_limit, c, fixed):
     combined = with_prefix(continuation)
     result = assess(start, t0, *combined, sigma_limit, c)
     # All counterfactuals share the executed bridge and its navigation covariance.
-    nominal_continuation = fixed_plan(fixed, predicted, stop, c, start_after_burn=False)
+    nominal_continuation = fixed_plan(fixed, true_state, stop, c, start_after_burn=False, estimator=estimator)
     nominal_metrics = assess(start, t0, *with_prefix(nominal_continuation), sigma_limit, c)
     incumbent_metrics = assess(start, t0, *base, sigma_limit, c)
-    nominal_check = improvement_check(result, nominal_metrics)
-    incumbent_check = improvement_check(result, incumbent_metrics)
+    continuation_pred = fixed_plan(fixed, predicted, stop, c, reference=reference)
+    result_pred = assess(est0, t0, *with_prefix(continuation_pred), sigma_limit, c)
+    nominal_pred = fixed_plan(fixed, predicted, stop, c, start_after_burn=False)
+    nominal_pred_metrics = assess(est0, t0, *with_prefix(nominal_pred), sigma_limit, c)
+    incumbent_pred_metrics = assess(est0, t0, *base_pred, sigma_limit, c)
+    continuation_pred_metrics = assess(predicted, stop, *continuation_pred, sigma_limit, c)
+    # nominal_check = improvement_check(result, nominal_metrics)
+    # incumbent_check = improvement_check(result, incumbent_metrics)
+    nominal_check = improvement_check(result_pred, nominal_pred_metrics)
+    incumbent_check = improvement_check(result_pred, incumbent_pred_metrics)
     spent_fuel = float(np.linalg.norm(base[1][prefix], axis=1).sum())
     # A computed plan is available only if it fits the explicitly modeled budget.
     deadline_met = status['elapsed_s'] <= delay
-    continuation_metrics = assess(predicted, stop, *continuation, sigma_limit, c)
-    switch = bool(status['feasible'] and continuation_metrics['physical_feasible'] and
+    continuation_metrics = assess(true_state, stop, *continuation, sigma_limit, c)
+    switch = bool(status['feasible'] and continuation_pred_metrics['physical_feasible'] and
                   deadline_met and nominal_check['accepted'] and incumbent_check['accepted'])
-    if not status['feasible'] or not continuation_metrics['physical_feasible']:
+    oracle_switch = bool(status['feasible'] and continuation_metrics['physical_feasible'] and
+                     deadline_met and improvement_check(result, nominal_metrics)['accepted'] and
+                     improvement_check(result, incumbent_metrics)['accepted'])
+    if not status['feasible'] or not continuation_pred_metrics['physical_feasible']:
         reason = 'infeasible_replanner'
     elif not deadline_met:
         reason = 'deadline_missed'
@@ -157,8 +188,33 @@ def handoff_plan(start, t0, base, delay, iterations, sigma_limit, c, fixed):
             'incumbent_remaining_fuel_m_s': incumbent_metrics['fuel_m_s']-spent_fuel,
             'modeled_arrival_time_s': stop,
             'deadline_met_on_test_machine': deadline_met,
-            'switched_to_replanner': switch}
+            'switched_to_replanner': switch,
+            'switch_oracle': oracle_switch,
+            'handoff_error_position_m': float(np.linalg.norm(handoff_err[:3])),
+            'handoff_error_velocity_m_s': float(np.linalg.norm(handoff_err[3:])),
+            'predicted_candidate_fuel_m_s': result_pred['fuel_m_s'],
+            'true_candidate_fuel_m_s': result['fuel_m_s'],
+            'predicted_continuation_failed_checks': continuation_pred_metrics['failed_checks'],
+            'true_continuation_failed_checks': continuation_metrics['failed_checks']}
     return (combined if switch else base), info
+
+
+def gate_outcomes(cases, row, gate_key, oracle_key):
+    """Compare a gate's decisions with the oracle's, using true outcomes."""
+    counts = {'correct_accept': 0, 'correct_reject': 0, 'safety_false_accept': 0,
+              'fuel_false_accept': 0, 'false_reject': 0}
+    for case in cases:
+        r = case[row]
+        gate, oracle = r[gate_key], r[oracle_key]
+        if gate and oracle:
+            counts['correct_accept'] += 1
+        elif not gate and not oracle:
+            counts['correct_reject'] += 1
+        elif gate:
+            counts['fuel_false_accept' if r['feasible'] else 'safety_false_accept'] += 1
+        else:
+            counts['false_reject'] += 1
+    return counts
 
 
 def summary(cases):
@@ -185,11 +241,17 @@ def summary(cases):
                         'mean_fuel_saving_vs_FRG_m_s': (float(np.mean([
                             r['FRG']['fuel_m_s']-r[name]['fuel_m_s'] for r in matched]))
                             if matched else None)}
+    # return {'methods': output, 'common_feasible_cases': len(common),
+    #         'pairwise_feasible_comparison': paired}
     return {'methods': output, 'common_feasible_cases': len(common),
-            'pairwise_feasible_comparison': paired}
+        'pairwise_feasible_comparison': paired,
+        'gate_outcomes': {
+            't0_learned_gate': gate_outcomes(cases, 'checked_learned',
+                                             'learned_accepted', 'learned_accepted_oracle'),
+            'handoff_scvx_gate': gate_outcomes(cases, 'checked_during_replanning',
+                                               'switched_to_replanner', 'switch_oracle')}}
 
-
-def run(data, test, out, delay=60., iterations=30):
+def run(data, test, out, delay=60., iterations=30, noise_scale=0., repeat=0):
     import minduli_compare as c
 
     c.NOM_TIMES, c.NOM_BURNS = data['nominal_times'], data['nominal_burns']
@@ -203,7 +265,7 @@ def run(data, test, out, delay=60., iterations=30):
         'protocol': 'shared-guidance-fuel-improvement-v3',
         'held_out_case_ids': [int(i) for i in test],
         'training': 'existing saved policies; no retraining',
-        'state': 'true disturbed state; ideal thrust; nonlinear two-body propagation',
+        'state': 'true state flown and scored; planners, gates and controller see an estimate (truth + sample from filter covariance) at the disturbance and handoff times only; true state at all other guidance nodes; ideal thrust; nonlinear two-body propagation',
         'fallback_guidance': 'FRG',
         'planning_delay_s': delay,
         'delay_source': 'assumed simulation budget, NOT a measured flight-processor runtime',
@@ -229,40 +291,58 @@ def run(data, test, out, delay=60., iterations=30):
         'learned_only': 'unscreened control baseline; nominal comparison recorded but not enforced',
         'checked_learned': 'accept feasible guided learned reference only if it improves on feasible FRG; feasible recovery allowed when FRG is infeasible',
         'checked_during_replanning': 'same learned selection, then switch only if feasible SCvx beats feasible nominal and incumbent continuations; otherwise retain incumbent',
+        'noise_scale': noise_scale,
+        'repeat': repeat,
     }
     output = {'setup': config, 'cases': {}}
-    destination = out/'comparison_fourway.json'
-    bounds = {}
+    destination = out/f'comparison_fourway_n{len(test)}_s{noise_scale:g}_r{repeat}.json'
+    bounds = {} 
     started = time.perf_counter()
+    P_at = c.covariance_timeline(c.nominal_trace_from(0.0))
     for number, case_id in enumerate(test, 1):
         i = int(case_id)
         start, t0 = data['starts'][i], float(data['replan_times'][i, 0])
+        z = c.standard_normal(i, t0, repeat)
+        err = c.sample_error(P_at(t0), z, noise_scale)
+        start_est = start + err
+        estimator = lambda t, current: current + err if abs(t - t0) < 1e-6 else current
         if t0 not in bounds:
             bounds[t0] = c.covariance_sigma(c.nominal_trace_from(t0))
         limit = bounds[t0]
-        frg = fixed_plan(fixed, start, t0, c)
+        frg = fixed_plan(fixed, start, t0, c, estimator=estimator)
         frg_metrics = assess(start, t0, *frg, limit, c)
         tic = time.perf_counter()
-        learned_reference = learned_plan(planner, start, t0, c)
+        learned_reference = learned_plan(planner, start_est, t0, c)
         generation_s = time.perf_counter()-tic
         tic = time.perf_counter()
-        learned = fixed_plan(fixed, start, t0, c, reference=(start, *learned_reference))
+        learned = fixed_plan(fixed, start, t0, c, reference=(start_est, *learned_reference), estimator=estimator)
         learned_metrics = assess(start, t0, *learned, limit, c)
+        frg_pred = fixed_plan(fixed, start_est, t0, c)
+        frg_pred_metrics = assess(start_est, t0, *frg_pred, limit, c)
+        learned_pred = fixed_plan(fixed, start_est, t0, c, reference=(start_est, *learned_reference))
+        learned_pred_metrics = assess(start_est, t0, *learned_pred, limit, c)
         checking_s = time.perf_counter()-tic
-        learned_check = improvement_check(learned_metrics, frg_metrics)
+        learned_check = improvement_check(learned_pred_metrics, frg_pred_metrics)   # what the gate decides
+        oracle_check = improvement_check(learned_metrics, frg_metrics)              # what it should have decided
         learned_metrics['comparison_to_nominal'] = learned_check
         accepted = learned_check['accepted']
+        frg_metrics['predicted_fuel_m_s'] = frg_pred_metrics['fuel_m_s']
+        learned_metrics['predicted_fuel_m_s'] = learned_pred_metrics['fuel_m_s']
         base = learned if accepted else frg
         checked = dict(learned_metrics if accepted else frg_metrics)
         checked['learned_accepted'] = accepted
+        checked['learned_accepted_oracle'] = oracle_check['accepted']
         checked['learned_comparison_to_nominal'] = learned_check
-        replacement, info = handoff_plan(start, t0, base, delay, iterations, limit, c, fixed)
+        base_pred = learned_pred if accepted else frg_pred
+        replacement, info = handoff_plan(start, t0, base, delay, iterations, limit, c, fixed, start_est=start_est, base_pred=base_pred)
         interim = assess(start, t0, *replacement, limit, c) if info['switched_to_replanner'] else dict(checked)
         interim.update(info, learned_accepted=accepted,
                        learned_comparison_to_nominal=learned_check,
                        bridge_guidance='learned' if accepted else 'FRG')
         rows = {'FRG': frg_metrics, 'learned_only': learned_metrics,
                 'checked_learned': checked, 'checked_during_replanning': interim}
+        rows['estimate_error'] = {'position_m': float(np.linalg.norm(err[:3])),
+                          'velocity_m_s': float(np.linalg.norm(err[3:]))}
         output['cases'][str(i)] = rows
         rows['learned_only'].update(generation_elapsed_s=generation_s, checker_elapsed_s=checking_s)
         output.update(summary(list(output['cases'].values())))

@@ -8,6 +8,7 @@ fixed-reference QCQP uses CW, the circular-orbit limit of the YA STM.
 import argparse
 import copy
 import json
+from os import times
 from pathlib import Path
 
 import numpy as np
@@ -150,7 +151,7 @@ def policy_action(policy, obs, ctx, stochastic):
 
 
 def episode_fixed(policy, start, t0, stochastic=False, constant=None, error=None, seed=0,
-                  start_after_burn=True, enforce_limit=False, ctx=None, reference=None):
+                  start_after_burn=True, enforce_limit=False, ctx=None, reference=None, estimator=None):
     # The guidance law is identical; only its reference state/impulses change.
     ref_start, ref_times, ref_burns = ((m.START, NOM_TIMES, NOM_BURNS)
                                         if reference is None else reference)
@@ -176,12 +177,13 @@ def episode_fixed(policy, start, t0, stochastic=False, constant=None, error=None
         x = x.copy()
         x[3:] += nominal_burn
         current = m.to_rel(x, t)
+        observed = current if estimator is None else estimator(t, current)
         remaining = np.count_nonzero(np.arange(540., m.TOF+1, 540.) > t)
-        obs = observation(current, nominal_post, t, remaining, prev_reward, prev_alpha)
+        obs = observation(observed, nominal_post, t, remaining, prev_reward, prev_alpha)
         step_ctx = np.zeros(48, np.float32) if ctx is None else ctx
         raw, logp, value = policy_action(policy, obs, step_ctx, stochastic)
         alpha = 0. if j == len(nodes)-2 else (constant if constant is not None else np.clip(raw[0]+1, 0, 2))
-        correction, feasible = qcqp(current-nominal_post, nxt-t, alpha)
+        correction, feasible = qcqp(observed-nominal_post, nxt-t, alpha)
         infeasible += not feasible
         impulse_limit_violations += np.max(np.abs(correction)) > 10
         if enforce_limit:
@@ -292,6 +294,50 @@ def episode_replan(policy, data, i, stochastic=False, error=None):
                      'velocity_m_s': np.linalg.norm(final[3:]-m.GOAL[3:]),
                      'pws_m': pws, 'pas_m': pas, 'tracking_m': tracking,
                      'burn_limit_violation_m_s': component_overflow}, trace
+
+
+def covariance_timeline(trace):
+    """Same angles-only EKF covariance run as covariance_sigma, but returns a lookup
+        at(T) giving the 6x6 covariance after the last 10 s measurement at or before T."""
+    #keep this function in sync with covariance_sigma
+    p = np.diag(np.array([300., 100., 100., .3, .3, .3])**2)
+    q = np.diag(np.array([50., 50., 50., .1, .1, .1])**2)
+    sensor = np.eye(3)*1e-6
+    ident = np.eye(6)
+    last_t = trace[0][0]
+    snaps = [(last_t, p.copy())]
+    measurements = np.r_[np.arange(last_t+10, trace[-1][1]-1e-6, 10.), trace[-1][1]]
+    for t, nxt, x in trace:
+        sample_times = measurements[(measurements > t+1e-6) & (measurements <= nxt+1e-6)]
+        if not len(sample_times):
+            continue
+        states = m.to_rel(m.propagate(x, sample_times-t), sample_times)
+        for ts, state in zip(sample_times, states):
+            dt = ts-last_t
+            a = cw(dt)
+            p = a@p@a.T + q*(dt/10)
+            r = state[:3]
+            distance = np.linalg.norm(r)
+            y = r/distance
+            h = np.zeros((3, 6))
+            h[:, :3] = (np.eye(3)-np.outer(y, y))/distance
+            hp = h@p
+            gain = np.linalg.solve(hp@h.T+sensor, hp).T
+            kh = ident-gain@h
+            p = kh@p@kh.T + gain@sensor@gain.T
+            last_t = ts
+            snaps.append((ts, p.copy()))
+    times = np.array([s[0] for s in snaps])
+    return lambda T: snaps[max(0, np.searchsorted(times, T+1e-6)-1)][1]
+
+
+def sample_error(P, z, scale=1.0):
+    w, v = np.linalg.eigh(P)
+    return scale * (v * np.sqrt(np.clip(w, 0, None))) @ z
+
+
+def standard_normal(case_id, t, repeat=0):
+    return np.random.default_rng([int(case_id), int(round(10*t)), int(repeat)]).standard_normal(6)
 
 
 def covariance_sigma(trace):
@@ -488,10 +534,10 @@ def train(data, train_ids, validation_ids, out, args):
               args.episodes, 9, out/'latent_ppo.pt')
 
 
-def evaluate(data, test, out, planning_delay_s=60., replanner_iterations=30):
+def evaluate(data, test, out, planning_delay_s=60., replanner_iterations=30, noise_scale=0.0, repeat=0):
     """Run FRG and the three learned recovery variants on identical cases."""
     from minduli_fourway import run
-    return run(data, test, out, planning_delay_s, replanner_iterations)
+    return run(data, test, out, planning_delay_s, replanner_iterations, noise_scale, repeat)
 
 
 def main():
@@ -508,6 +554,8 @@ def main():
     parser.add_argument('--planning-delay-s', type=float, default=60.,
                         help='Assumed SCvx arrival budget in simulation seconds, not flight-hardware timing')
     parser.add_argument('--replanner-iterations', type=int, default=30)
+    parser.add_argument('--noise-scale', type=float, default=0.)
+    parser.add_argument('--repeat', type=int, default=0)
     args = parser.parse_args()
     if args.self_check:
         self_check()
@@ -532,8 +580,8 @@ def main():
         parser.error('--replanner-iterations must be positive')
     if args.train:
         train(data, train_ids, validation_ids, args.output, args)
-    evaluate(data, test, args.output, args.planning_delay_s, args.replanner_iterations)
-
+    evaluate(data, test, args.output, args.planning_delay_s, args.replanner_iterations,
+         args.noise_scale, args.repeat)
 
 if __name__ == '__main__':
     main()
