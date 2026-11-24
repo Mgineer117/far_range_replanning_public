@@ -21,6 +21,7 @@ import minduli_setting as m
 torch.set_num_threads(1)
 SCALE = np.array([100_000.0]*3 + [5.0]*3)
 DEV_SCALE = np.array([15_000.0]*3 + [1.0]*3)
+REPLAN_CONTEXT_SAMPLES = 6
 
 
 def cw(dt):
@@ -47,7 +48,7 @@ def observation(state, nominal, t, remaining, prev_reward=0, prev_alpha=1):
 
 
 def context(state, nominal_path, t):
-    future = np.linspace(t, m.TOF, 8)
+    future = np.linspace(t, m.TOF, REPLAN_CONTEXT_SAMPLES)
     states = m.trajectory(m.START, NOM_TIMES, NOM_BURNS, future)
     return np.clip(((states-state)/DEV_SCALE).ravel(), -10, 10).astype(np.float32)
 
@@ -102,7 +103,8 @@ class ReplanPolicy(nn.Module):
     def __init__(self):
         super().__init__()
         self.original = nn.Sequential(nn.Linear(21, 64), nn.Tanh(), nn.Linear(64, 32), nn.Tanh())
-        self.context = nn.Sequential(nn.Linear(48, 32), nn.Tanh(), nn.Linear(32, 8), nn.Tanh())
+        self.context = nn.Sequential(nn.Linear(6 * REPLAN_CONTEXT_SAMPLES, 32), nn.Tanh(),
+                                     nn.Linear(32, 8), nn.Tanh())
         self.head = nn.Sequential(nn.Linear(40, 64), nn.Tanh())
         self.actor = nn.Linear(64, 12)
         self.critic = nn.Linear(64, 1)

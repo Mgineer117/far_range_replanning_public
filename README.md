@@ -14,6 +14,8 @@ Code and saved inputs for comparing four recovery strategies in a far-range, ang
 
 The cases comprise ten perturbations at each of 100 nominal points. We assign every fifth point to validation and the other points to training, giving 800 training and 200 validation cases. The validation set is used for checkpoint selection and evaluation.
 
+The replanner uses a 21-component observation and 36 context features from six equally spaced nominal state samples. It predicts corrections for the first four burns and computes the final two by terminal targeting. The bundled replanner checkpoint was selected after imitation training because the subsequent PPO updates yielded higher validation costs.
+
 ## Run
 
 Python 3.9 with the versions in `requirements.txt` was used for the saved runs.
@@ -29,7 +31,7 @@ python minduli_interim.py --self-check
 python minduli_compare.py
 ```
 
-`minduli_compare.py` evaluates the saved weights on the 200 validation cases and writes `results/comparison_fourway.json`. The bundled checkpoints were trained under the prior split. Use `python minduli_compare.py --train` to train with the new split on the existing data. The old `comparison.json` is a historical experiment with a stored-PSO fallback, not the current four-way result. `minduli_interim.py` is a separate historical PSO-delay experiment; it is not called by the main comparison.
+`minduli_compare.py` evaluates the saved weights on the 200 validation cases and writes `results/comparison_fourway.json`. The bundled replanner uses six context samples and the 80/20 split. The bundled tracking policy was trained under the prior split. Use `python minduli_compare.py --train` to retrain both policies on the existing data. The old `comparison.json` is a historical experiment with a stored-PSO fallback, not the current four-way result. `minduli_interim.py` is a separate historical PSO-delay experiment; it is not called by the main comparison.
 
 ## Four-way comparison setup
 
@@ -117,7 +119,7 @@ The current protocol is `shared-guidance-fuel-improvement-v3`. Results are writt
 to `results/comparison_fourway.json`; `completed_cases` distinguishes partial runs
 from the complete 200-case evaluation.
 
-The results below use the prior split's 200 held-out cases with the saved policies, a
+The results below use the prior split's 200 held-out cases and the historical eight-sample replanner, a
 60 s assumed handoff budget, and at most 30 SCvx iterations.
 
 | Method | Physical feasibility (higher is better) | Including covariance (higher is better) | Mean fuel on the same 15 cases feasible for all four (m/s; lower is better) |
