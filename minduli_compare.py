@@ -1,7 +1,7 @@
 """Compare reconstructed fixed-reference PPO/QCQP with learned replanning.
 
 Run after ``minduli_setting.py generate``. Both controllers use the same
-nonlinear mission dynamics and the same held-out disturbance states. The
+nonlinear mission dynamics and the same validation disturbance states. The
 fixed-reference QCQP uses CW, the circular-orbit limit of the YA STM.
 """
 
@@ -355,7 +355,7 @@ def ppo_train(policy, rollout, train_ids, validation_ids, updates, episodes, see
     rng = np.random.default_rng(seed)
     optimizer = torch.optim.Adam(policy.parameters(), lr=.003 if isinstance(policy, FixedPolicy) else .0002)
     def validation():
-        ms = [rollout(policy, int(i), False)[1] for i in validation_ids[:min(20, len(validation_ids))]]
+        ms = [rollout(policy, int(i), False)[1] for i in validation_ids]
         return float(np.mean([v['position_m']/1000+v['velocity_m_s']/.5+.05*v['fuel_m_s']+
                               100*(v['pws_m']<m.KOZ)+100*(v['pas_m']<m.KOZ)+
                               100*v.get('burn_limit_violation_m_s', 0) for v in ms]))
@@ -488,10 +488,17 @@ def train(data, train_ids, validation_ids, out, args):
               args.episodes, 9, out/'latent_ppo.pt')
 
 
-def evaluate(data, test, out, planning_delay_s=60., replanner_iterations=30):
+def split_cases(data):
+    """Keep each disturbance time in either training or validation."""
+    groups = np.arange(len(data['starts'])) // int(data['per_point'])
+    validation = groups % 5 == 0
+    return np.flatnonzero(~validation), np.flatnonzero(validation)
+
+
+def evaluate(data, validation_ids, out, planning_delay_s=60., replanner_iterations=30):
     """Run FRG and the three learned recovery variants on identical cases."""
     from minduli_fourway import run
-    return run(data, test, out, planning_delay_s, replanner_iterations)
+    return run(data, validation_ids, out, planning_delay_s, replanner_iterations)
 
 
 def main():
@@ -504,7 +511,7 @@ def main():
     parser.add_argument('--paper-updates', type=int, default=80)
     parser.add_argument('--episodes', type=int, default=20)
     parser.add_argument('--epochs', type=int, default=150)
-    parser.add_argument('--cases', type=int, help='Evenly sample this many held-out cases; default: all 200')
+    parser.add_argument('--cases', type=int, help='Evenly sample this many validation cases for evaluation; default: all 200')
     parser.add_argument('--planning-delay-s', type=float, default=60.,
                         help='Assumed SCvx arrival budget in simulation seconds, not flight-hardware timing')
     parser.add_argument('--replanner-iterations', type=int, default=30)
@@ -520,19 +527,17 @@ def main():
         data = {key: file[key] for key in file.files}
     global NOM_TIMES, NOM_BURNS
     NOM_TIMES, NOM_BURNS = data['nominal_times'], data['nominal_burns']
-    groups = np.arange(len(data['starts']))//int(data['per_point'])
-    train_ids = np.flatnonzero((groups%5 != 0)&(groups%10 != 1))
-    validation_ids = np.flatnonzero(groups%10 == 1)
-    test = np.flatnonzero(groups%5 == 0)
+    train_ids, validation_ids = split_cases(data)
+    evaluation_ids = validation_ids
     if args.cases is not None:
-        if not 1 <= args.cases <= len(test):
-            parser.error('--cases must be between 1 and the held-out case count')
-        test = test[np.linspace(0, len(test)-1, args.cases, dtype=int)]
+        if not 1 <= args.cases <= len(validation_ids):
+            parser.error('--cases must be between 1 and the validation case count')
+        evaluation_ids = validation_ids[np.linspace(0, len(validation_ids)-1, args.cases, dtype=int)]
     if args.replanner_iterations < 1:
         parser.error('--replanner-iterations must be positive')
     if args.train:
         train(data, train_ids, validation_ids, args.output, args)
-    evaluate(data, test, args.output, args.planning_delay_s, args.replanner_iterations)
+    evaluate(data, evaluation_ids, args.output, args.planning_delay_s, args.replanner_iterations)
 
 
 if __name__ == '__main__':

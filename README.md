@@ -12,7 +12,7 @@ Code and saved inputs for comparing four recovery strategies in a far-range, ang
 | `data/minduli_setting_data.npz` | The 1,000 recovery cases. |
 | `results/fixed_ppo.pt`, `results/latent_ppo.pt` | Saved weights for the two policies. |
 
-The cases comprise ten perturbations at each of 100 nominal points. The split by nominal point is 700 training, 100 validation, and 200 held-out cases.
+The cases comprise ten perturbations at each of 100 nominal points. We assign every fifth point to validation and the other points to training, giving 800 training and 200 validation cases. The validation set is used for checkpoint selection and evaluation.
 
 ## Run
 
@@ -29,7 +29,7 @@ python minduli_interim.py --self-check
 python minduli_compare.py
 ```
 
-`minduli_compare.py` now evaluates the saved weights on the 200 held-out cases and writes `results/comparison_fourway.json`. The old `comparison.json` is a historical experiment with a stored-PSO fallback, not the current four-way result. `minduli_interim.py` is also retained as a separate historical PSO-delay experiment; it is not called by the main comparison. To regenerate the data and retrain the policies, run `python minduli_setting.py generate` followed by `python minduli_compare.py --train`. Retraining is stochastic and need not reproduce the saved weights exactly.
+`minduli_compare.py` evaluates the saved weights on the 200 validation cases and writes `results/comparison_fourway.json`. The bundled checkpoints were trained under the prior split. Use `python minduli_compare.py --train` to train with the new split on the existing data. The old `comparison.json` is a historical experiment with a stored-PSO fallback, not the current four-way result. `minduli_interim.py` is a separate historical PSO-delay experiment; it is not called by the main comparison.
 
 ## Four-way comparison setup
 
@@ -46,7 +46,7 @@ python minduli_compare.py --cases 5 --planning-delay-s 60 --replanner-iterations
 python minduli_compare.py --planning-delay-s 60 --replanner-iterations 30
 ```
 
-The default is all 200 held-out states, with no retraining, true-state inputs,
+The default is all 200 validation states, with no retraining, true-state inputs,
 ideal thrust, and nonlinear two-body propagation. Learned and SCvx recovery
 references each have six newly spaced maneuver nodes. All methods use the
 same saved alpha-selection policy and QCQP correction law on the original
@@ -99,7 +99,7 @@ SCvx termination/convergence, switch decisions, and solver timing. Aggregates
 separate physical feasibility from the additional covariance check. Fuel is
 reported both over all cases (including failures) and on jointly feasible
 cases; only the latter supports a matched efficiency comparison. Partial
-results are saved after every case. `--cases` evenly samples the test split.
+results are saved after every case. `--cases` evenly samples the validation set for evaluation.
 
 ## Four-way results
 
@@ -117,7 +117,7 @@ The current protocol is `shared-guidance-fuel-improvement-v3`. Results are writt
 to `results/comparison_fourway.json`; `completed_cases` distinguishes partial runs
 from the complete 200-case evaluation.
 
-The updated run completed all 200 held-out cases with the saved policies, a
+The results below use the prior split's 200 held-out cases with the saved policies, a
 60 s assumed handoff budget, and at most 30 SCvx iterations.
 
 | Method | Physical feasibility (higher is better) | Including covariance (higher is better) | Mean fuel on the same 15 cases feasible for all four (m/s; lower is better) |
@@ -152,7 +152,7 @@ python minduli_scvx.py --case 0 --initialization learned
 python minduli_scvx.py --case 0 --initialization pso
 ```
 
-`--case` selects an index in the saved dataset (not all indices are held-out).
+`--case` selects any index in the saved dataset.
 Each run writes `results/scvx_<case>_<initialization>_<objective>.json`, including
 the plan, constraint checks, trust-region history, termination status, and timing.
 Cold initialization starts the first four burns at zero. The CLI exits with code

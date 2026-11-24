@@ -1,4 +1,4 @@
-"""Provisional burn during PSO replanning on the held-out rendezvous cases."""
+"""Provisional burn during PSO replanning on the validation rendezvous cases."""
 
 import argparse
 import json
@@ -117,14 +117,14 @@ def same_pipeline():
     surrogate = c.ReplanPolicy()
     surrogate.load_state_dict(torch.load(RESULTS/'latent_ppo.pt', weights_only=True))
     surrogate.eval()
-    test = np.flatnonzero((np.arange(len(data['starts']))//int(data['per_point']))%5 == 0)
-    assert len(test) == 200
-    output = {'setting': 'same 200 held-out disturbances, no thrust error',
+    _, validation_ids = c.split_cases(data)
+    assert len(validation_ids) == 200
+    output = {'setting': 'same 200 validation disturbances, no thrust error',
               'planning_delay_s': .1078,
               'delay_source': 'fixed modeled delay from a prior median PSO solve',
               'cases': {}}
     path = RESULTS/'interim_same_pipeline.json'
-    for n, i in enumerate(test, 1):
+    for n, i in enumerate(validation_ids, 1):
         i = int(i)
         start, t0 = data['starts'][i], float(data['replan_times'][i, 0])
         proposed = predicted_plan(surrogate, data, i)

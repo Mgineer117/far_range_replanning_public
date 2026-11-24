@@ -189,11 +189,11 @@ def summary(cases):
             'pairwise_feasible_comparison': paired}
 
 
-def run(data, test, out, delay=60., iterations=30):
+def run(data, validation_ids, out, delay=60., iterations=30):
     import minduli_compare as c
 
     c.NOM_TIMES, c.NOM_BURNS = data['nominal_times'], data['nominal_burns']
-    if not np.isfinite(delay) or delay < 0 or any(data['replan_times'][test, 0]+delay >= m.TOF):
+    if not np.isfinite(delay) or delay < 0 or any(data['replan_times'][validation_ids, 0]+delay >= m.TOF):
         raise ValueError('Planning delay must be nonnegative and leave time before arrival for every case')
     fixed, planner = c.FixedPolicy(), c.ReplanPolicy()
     fixed.load_state_dict(torch.load(out/'fixed_ppo.pt', map_location='cpu', weights_only=True))
@@ -201,8 +201,9 @@ def run(data, test, out, delay=60., iterations=30):
     fixed.eval(); planner.eval()
     config = {
         'protocol': 'shared-guidance-fuel-improvement-v3',
-        'held_out_case_ids': [int(i) for i in test],
-        'training': 'existing saved policies; no retraining',
+        'held_out_case_ids': [int(i) for i in validation_ids],
+        'evaluation_split': 'validation',
+        'training': 'policy checkpoints loaded from the output directory',
         'state': 'true disturbed state; ideal thrust; nonlinear two-body propagation',
         'fallback_guidance': 'FRG',
         'planning_delay_s': delay,
@@ -234,7 +235,7 @@ def run(data, test, out, delay=60., iterations=30):
     destination = out/'comparison_fourway.json'
     bounds = {}
     started = time.perf_counter()
-    for number, case_id in enumerate(test, 1):
+    for number, case_id in enumerate(validation_ids, 1):
         i = int(case_id)
         start, t0 = data['starts'][i], float(data['replan_times'][i, 0])
         if t0 not in bounds:
@@ -269,7 +270,7 @@ def run(data, test, out, delay=60., iterations=30):
         output['completed_cases'] = number
         output['elapsed_s'] = time.perf_counter()-started
         destination.write_text(json.dumps(output, indent=2, allow_nan=False)+'\n')
-        print(f'Four-way {number}/{len(test)}: case {i}, candidate={accepted}, '
+        print(f'Four-way {number}/{len(validation_ids)}: case {i}, candidate={accepted}, '
               f"switch={info['switched_to_replanner']}, solve={info['replanner_elapsed_s']:.2f}s", flush=True)
     output['learned_accepted'] = sum(v['checked_learned']['learned_accepted'] for v in output['cases'].values())
     output['replanner_switches'] = sum(v['checked_during_replanning']['switched_to_replanner'] for v in output['cases'].values())
