@@ -21,7 +21,6 @@ import minduli_setting as m
 torch.set_num_threads(1)
 SCALE = np.array([100_000.0]*3 + [5.0]*3)
 DEV_SCALE = np.array([15_000.0]*3 + [1.0]*3)
-REPLAN_CONTEXT_SAMPLES = 6
 
 
 def cw(dt):
@@ -47,10 +46,8 @@ def observation(state, nominal, t, remaining, prev_reward=0, prev_alpha=1):
                          (state-nominal)/DEV_SCALE], -10, 10).astype(np.float32)
 
 
-def context(state, nominal_path, t):
-    future = np.linspace(t, m.TOF, REPLAN_CONTEXT_SAMPLES)
-    states = m.trajectory(m.START, NOM_TIMES, NOM_BURNS, future)
-    return np.clip(((states-state)/DEV_SCALE).ravel(), -10, 10).astype(np.float32)
+def replan_input(state, t):
+    return np.r_[state, t].astype(np.float32)
 
 
 def qcqp(deviation, dt, alpha):
@@ -91,10 +88,10 @@ class FixedPolicy(nn.Module):
         self.actor, self.critic = net(), net()
         self.log_std = nn.Parameter(torch.tensor([np.log(.25)], dtype=torch.float32))
 
-    def forward(self, obs, ctx=None):
+    def forward(self, obs):
         return self.actor(obs), self.critic(obs).squeeze(-1)
 
-    def distribution(self, obs, ctx=None):
+    def distribution(self, obs):
         mean, value = self(obs)
         return Normal(mean, self.log_std.clamp(-3, .5).exp()), value
 
@@ -102,20 +99,20 @@ class FixedPolicy(nn.Module):
 class ReplanPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.original = nn.Sequential(nn.Linear(21, 64), nn.Tanh(), nn.Linear(64, 32), nn.Tanh())
-        self.context = nn.Sequential(nn.Linear(6 * REPLAN_CONTEXT_SAMPLES, 32), nn.Tanh(),
-                                     nn.Linear(32, 8), nn.Tanh())
-        self.head = nn.Sequential(nn.Linear(40, 64), nn.Tanh())
+        self.register_buffer('input_scale', torch.tensor(np.r_[SCALE, m.TOF], dtype=torch.float32),
+                             persistent=False)
+        self.head = nn.Sequential(nn.Linear(7, 64), nn.Tanh(), nn.Linear(64, 32), nn.Tanh(),
+                                  nn.Linear(32, 64), nn.Tanh())
         self.actor = nn.Linear(64, 12)
         self.critic = nn.Linear(64, 1)
         self.log_std = nn.Parameter(torch.full((12,), -3.0))
 
-    def forward(self, obs, ctx):
-        h = self.head(torch.cat((self.original(obs), self.context(ctx)), dim=-1))
+    def forward(self, obs):
+        h = self.head(obs / self.input_scale)
         return self.actor(h), self.critic(h).squeeze(-1)
 
-    def distribution(self, obs, ctx):
-        mean, value = self(obs, ctx)
+    def distribution(self, obs):
+        mean, value = self(obs)
         return Normal(mean, self.log_std.clamp(-3, .5).exp()), value
 
 
@@ -141,18 +138,17 @@ def execute_error(eci_burn, t, rng, level):
                                      np.cos(beta)*np.cos(gamma), np.sin(beta)]))
 
 
-def policy_action(policy, obs, ctx, stochastic):
+def policy_action(policy, obs, stochastic):
     obs_t = torch.from_numpy(obs)[None]
-    ctx_t = torch.from_numpy(ctx)[None]
     with torch.no_grad():
-        distribution, value = policy.distribution(obs_t, ctx_t)
+        distribution, value = policy.distribution(obs_t)
         raw = distribution.sample()[0] if stochastic else distribution.mean[0]
         logp = distribution.log_prob(raw[None]).sum().item()
     return raw.numpy(), logp, value.item()
 
 
 def episode_fixed(policy, start, t0, stochastic=False, constant=None, error=None, seed=0,
-                  start_after_burn=True, enforce_limit=False, ctx=None, reference=None):
+                  start_after_burn=True, enforce_limit=False, reference=None):
     # The guidance law is identical; only its reference state/impulses change.
     ref_start, ref_times, ref_burns = ((m.START, NOM_TIMES, NOM_BURNS)
                                         if reference is None else reference)
@@ -180,8 +176,7 @@ def episode_fixed(policy, start, t0, stochastic=False, constant=None, error=None
         current = m.to_rel(x, t)
         remaining = np.count_nonzero(np.arange(540., m.TOF+1, 540.) > t)
         obs = observation(current, nominal_post, t, remaining, prev_reward, prev_alpha)
-        step_ctx = np.zeros(48, np.float32) if ctx is None else ctx
-        raw, logp, value = policy_action(policy, obs, step_ctx, stochastic)
+        raw, logp, value = policy_action(policy, obs, stochastic)
         alpha = 0. if j == len(nodes)-2 else (constant if constant is not None else np.clip(raw[0]+1, 0, 2))
         correction, feasible = qcqp(current-nominal_post, nxt-t, alpha)
         infeasible += not feasible
@@ -218,7 +213,7 @@ def episode_fixed(policy, start, t0, stochastic=False, constant=None, error=None
         obs_penalty = 1000*max(0, eta-eta_nom)
         reward = -(np.linalg.norm(commanded)+safety+obs_penalty)
         if stochastic:
-            records.append((obs, step_ctx, raw.astype(np.float32), logp, value, reward/1000))
+            records.append((obs, raw.astype(np.float32), logp, value, reward/1000))
         prev_reward, prev_alpha = reward, alpha
         x = x_next
     # Final nominal burn at arrival, matching the paper's six-impulse schedule.
@@ -246,10 +241,8 @@ def minimum_norm_seed(start, times):
 def episode_replan(policy, data, i, stochastic=False, error=None):
     start = data['starts'][i]
     times = data['replan_times'][i]
-    nominal = m.trajectory(m.START, NOM_TIMES, NOM_BURNS, np.array([times[0]]))[0]
-    obs = observation(start, nominal, times[0], (m.TOF-times[0])/540)
-    ctx = context(start, None, times[0])
-    raw, logp, value = policy_action(policy, obs, ctx, stochastic)
+    obs = replan_input(start, times[0])
+    raw, logp, value = policy_action(policy, obs, stochastic)
     first_four = np.clip(minimum_norm_seed(start, times)[:4]+10*np.tanh(raw).reshape(4, 3), -10, 10)
     burns, miss = m.complete_last_two(start, times, first_four)
     burns = burns[0].copy()
@@ -289,7 +282,7 @@ def episode_replan(policy, data, i, stochastic=False, error=None):
     component_overflow = float(np.maximum(np.abs(burns)-10, 0).sum())
     safety = max(0, m.KOZ-pws, m.KOZ-pas)/m.KOZ
     reward = -(tracking/1000 + .05*fuel + 100*safety + 100*component_overflow)
-    records = [(obs, ctx, raw.astype(np.float32), logp, value, reward/10)] if stochastic else []
+    records = [(obs, raw.astype(np.float32), logp, value, reward/10)] if stochastic else []
     return records, {'fuel_m_s': fuel, 'position_m': np.linalg.norm(final[:3]-m.GOAL[:3]),
                      'velocity_m_s': np.linalg.norm(final[3:]-m.GOAL[3:]),
                      'pws_m': pws, 'pas_m': pas, 'tracking_m': tracking,
@@ -380,15 +373,14 @@ def ppo_train(policy, rollout, train_ids, validation_ids, updates, episodes, see
             advs.extend(episode_adv)
             returns.extend(episode_adv+values[:-1])
         obs = torch.tensor(np.stack([r[0] for r in rows]))
-        ctx = torch.tensor(np.stack([r[1] for r in rows]))
-        actions = torch.tensor(np.stack([r[2] for r in rows]))
-        old_logp = torch.tensor([r[3] for r in rows], dtype=torch.float32)
+        actions = torch.tensor(np.stack([r[1] for r in rows]))
+        old_logp = torch.tensor([r[2] for r in rows], dtype=torch.float32)
         adv = torch.tensor(np.asarray(advs))
         adv = (adv-adv.mean())/(adv.std()+1e-6)
         targets = torch.tensor(np.asarray(returns))
         for _ in range(10):
             for batch in torch.randperm(len(rows)).split(64):
-                dist, value = policy.distribution(obs[batch], ctx[batch])
+                dist, value = policy.distribution(obs[batch])
                 ratio = (dist.log_prob(actions[batch]).sum(-1)-old_logp[batch]).exp()
                 objective = torch.minimum(ratio*adv[batch], ratio.clamp(.9, 1.1)*adv[batch])
                 loss = -objective.mean()+.5*(value-targets[batch]).square().mean()-.01*dist.entropy().mean()
@@ -414,16 +406,15 @@ def imitation(policy, data, train_ids, epochs=80):
     for i in train_ids:
         t = data['replan_times'][i, 0]
         state = data['starts'][i]
-        nominal = m.trajectory(m.START, NOM_TIMES, NOM_BURNS, np.array([t]))[0]
         burns = data['replan_burns'][i, :4]
         seed = minimum_norm_seed(state, data['replan_times'][i])[:4]
-        rows.append((observation(state, nominal, t, (m.TOF-t)/540), context(state, None, t),
+        rows.append((replan_input(state, t),
                      np.arctanh(np.clip(((burns-seed)/10).ravel(), -.999, .999)).astype(np.float32)))
-    obs, ctx, action = [torch.tensor(np.stack([r[j] for r in rows])) for j in range(3)]
+    obs, action = [torch.tensor(np.stack(column)) for column in zip(*rows)]
     optimizer = torch.optim.Adam(policy.parameters(), lr=.001)
     for epoch in range(epochs):
         for batch in torch.randperm(len(rows)).split(256):
-            raw, _ = policy(obs[batch], ctx[batch])
+            raw, _ = policy(obs[batch])
             loss = (10*raw.tanh()-10*action[batch].tanh()).square().sum(-1).mean()
             optimizer.zero_grad()
             loss.backward()
@@ -441,6 +432,10 @@ def self_check():
     assert np.linalg.norm(cw(540.)@np.r_[delta[:3], delta[3:]+control]) <= .7*np.linalg.norm(delta)+1e-5
     start = m.START + np.array([5000., -1000., 200., 0., 0., 0.])
     times = np.linspace(4320., m.TOF, 6)
+    obs = replan_input(start, times[0])
+    np.testing.assert_allclose(obs, np.r_[start, times[0]])
+    raw, _, _ = policy_action(ReplanPolicy(), obs, False)
+    assert raw.shape == (12,) and np.isfinite(raw).all()
     burns, miss = m.complete_last_two(start, times, minimum_norm_seed(start, times)[:4])
     assert miss[0] < 1e-3 and np.isfinite(burns).all()
     print('QCQP contraction and nonlinear terminal solve checks passed')

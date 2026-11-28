@@ -19,9 +19,7 @@ STEP = 540.
 def predicted_plan(surrogate, data, i):
     start, times = data['starts'][i], data['replan_times'][i]
     t0 = float(times[0])
-    nominal = m.trajectory(m.START, c.NOM_TIMES, c.NOM_BURNS, np.array([t0]))[0]
-    obs = c.observation(start, nominal, t0, (m.TOF-t0)/STEP)
-    raw, _, _ = c.policy_action(surrogate, obs, c.context(start, None, t0), False)
+    raw, _, _ = c.policy_action(surrogate, c.replan_input(start, t0), False)
     first_four = np.clip(c.minimum_norm_seed(start, times)[:4] +
                          10*np.tanh(raw).reshape(4, 3), -10, 10)
     burns, _ = m.complete_last_two(start, times, first_four)
@@ -74,7 +72,7 @@ def same_pipeline_case(policy, start, t0, proposed, seed, delay=.1078):
         next_guidance = (np.floor(t0/STEP)+1)*STEP
         obs = c.observation(start, reference, t0,
                             int(np.ceil((m.TOF-t0)/STEP)))
-        raw, _, _ = c.policy_action(policy, obs, np.zeros(48, np.float32), False)
+        raw, _, _ = c.policy_action(policy, obs, False)
         correction, _ = c.qcqp(start-reference, next_guidance-t0,
                                 float(np.clip(raw[0]+1, 0, 2)))
         correction *= min(1, 10/(np.max(np.abs(correction))+1e-12))

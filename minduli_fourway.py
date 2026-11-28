@@ -49,9 +49,7 @@ def fixed_plan(fixed, start, t0, c, reference=None, start_after_burn=True):
 
 def learned_plan(planner, start, t0, c):
     times = np.linspace(t0, m.TOF, 6)
-    nominal = m.trajectory(m.START, c.NOM_TIMES, c.NOM_BURNS, np.array([t0]))[0]
-    raw, _, _ = c.policy_action(planner, c.observation(start, nominal, t0, (m.TOF-t0)/540),
-                                 c.context(start, None, t0), False)
+    raw, _, _ = c.policy_action(planner, c.replan_input(start, t0), False)
     first = np.clip(c.minimum_norm_seed(start, times)[:4]+10*np.tanh(raw).reshape(4, 3), -10, 10)
     return times, m.complete_last_two(start, times, first)[0][0]
 
