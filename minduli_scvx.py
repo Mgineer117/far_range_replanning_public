@@ -1,6 +1,6 @@
 """Reduced-space successive convexification for the six-impulse RPO model.
 
-Nonlinear shooting eliminates the states and terminal burn pair. Convex steps
+Lambert targeting eliminates the states and terminal burn pair. Convex steps
 linearize the remaining burn and sampled clearance maps, with elastic slacks
 and a merit-ratio trust region. This is an SCvx-style numerical baseline, not
 an implementation carrying the convergence theorem of a particular SCvx paper.

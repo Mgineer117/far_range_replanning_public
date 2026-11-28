@@ -14,7 +14,7 @@ Code and saved inputs for comparing four recovery strategies in a far-range, ang
 
 The cases comprise ten perturbations at each of 100 nominal points. We assign every fifth point to validation and the other points to training, giving 800 training and 200 validation cases. The validation set is used for checkpoint selection and evaluation.
 
-The replanner takes seven inputs: the disturbed chaser position and velocity in the target-relative frame, and the disturbance time. It normalizes these inputs internally using fixed scales. It predicts corrections for the first four burns and computes the final two by terminal targeting. The bundled replanner checkpoint is from PPO update 35, which had the lowest validation cost.
+The replanner takes seven inputs: the disturbed chaser position and velocity in the target-relative frame, and the disturbance time. It normalizes these inputs internally using fixed scales. It predicts corrections for the first four burns. The replanner and PSO both use the target-aligned, zero-revolution Lambert transfer for burn five and match the arrival velocity with burn six. The bundled dataset and checkpoint were generated with the earlier shooting solver. The bundled replanner checkpoint is from PPO update 35, which had the lowest validation cost.
 
 ## Run
 
@@ -167,8 +167,8 @@ The default `--objective mission` retains `score()`'s normalized fuel,
 line-of-sight geometry, and Gaussian safety costs, while handling clearance and
 burn limits with explicit linearized constraints. `--objective fuel` instead
 minimizes total impulse magnitude and is a different optimization problem.
-Both use fixed six-burn times, nonlinear two-body propagation, and terminal
-shooting for the final two burns. `warm` in the callable `scvx()` accepts either
+Both use fixed six-burn times, nonlinear two-body propagation, and Lambert
+targeting for the final two burns. `warm` in the callable `scvx()` accepts either
 a `(4, 3)` or `(6, 3)` array of ECI burns.
 
 This is a reduced-space SCvx-style implementation: central finite differences,

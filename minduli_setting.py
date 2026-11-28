@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from scipy.special import hyp2f1
 
 
 # Earth's gravitational parameter, G * Earth mass [m^3/s^2].
@@ -119,8 +120,82 @@ def propagate(x, dt):
     return np.concatenate((r, fdot[..., None]*r0 + gdot[..., None]*v0), axis=-1)
 
 
-def complete_last_two(start, times, first_four, initial=None):
-    """Terminal shooting: solve the penultimate burn, then match final velocity."""
+def _lambert_time(x, geometry):
+    """Dimensionless zero-revolution time of flight (Izzo 2015, Eqs. 18 and 20)."""
+    y = np.sqrt(1 - geometry**2 * (1 - x**2))
+    time = np.empty_like(x)
+    near_parabolic = np.abs(x - 1) < .2
+    elliptic = (x < 1) & ~near_parabolic
+    hyperbolic = (x > 1) & ~near_parabolic
+
+    for mask, bound in ((elliptic, True), (hyperbolic, False)):
+        xm, ym, gm = x[mask], y[mask], geometry[mask]
+        energy = 1 - xm**2
+        root = np.sqrt(np.abs(energy))
+        eta = (ym - gm * xm) * root
+        psi = np.arctan2(eta, xm * ym + gm * energy) if bound else np.arcsinh(eta)
+        time[mask] = (psi / root - xm + gm * ym) / energy
+
+    xm, ym, gm = x[near_parabolic], y[near_parabolic], geometry[near_parabolic]
+    eta = ym - gm * xm
+    series_argument = (1 - gm - xm * eta) / 2
+    time[near_parabolic] = (2/3) * eta**3 * hyp2f1(3, 1, 2.5, series_argument) + 2 * gm * eta
+    return time
+
+
+def _lambert_velocities(departure, arrival, duration):
+    """Batch two-body transfer velocities on the target-aligned, zero-revolution branch."""
+    r1 = np.linalg.norm(departure, axis=-1)
+    r2 = np.linalg.norm(arrival)
+    chord = np.linalg.norm(arrival - departure, axis=-1)
+    if not np.isfinite(duration) or duration <= 0 or np.any(chord == 0):
+        raise ValueError('Lambert targeting requires a positive coast and distinct endpoints')
+    semiperimeter = (r1 + r2 + chord) / 2
+    radial1, radial2 = departure / r1[:, None], arrival / r2
+
+    normal = np.cross(radial1, radial2)
+    direction = np.where(normal @ H < 0, -1., 1.)
+    aligned = normal * direction[:, None]
+    # At antipodal endpoints use the target orbital plane to fix the ambiguity.
+    norm = np.linalg.norm(aligned, axis=-1)
+    target_normal = H - (radial1 @ H)[:, None] * radial1
+    aligned = np.where((norm < 1e-14)[:, None], target_normal, aligned)
+    aligned /= np.linalg.norm(aligned, axis=-1)[:, None]
+    geometry = (direction * np.sqrt(r1 * r2)
+                * np.linalg.norm(radial1 + radial2, axis=-1) / (2 * semiperimeter))
+    flight_time = duration * np.sqrt(2 * MU / semiperimeter**3)
+
+    # The time of flight decreases monotonically on the zero-revolution branch.
+    low = np.full_like(r1, -1.)
+    high = np.ones_like(r1)
+    for _ in range(64):
+        too_slow = _lambert_time(high, geometry) > flight_time
+        if not np.any(too_slow):
+            break
+        high[too_slow] *= 2
+    else:
+        raise ValueError('Could not bracket the Lambert time of flight')
+    for _ in range(46):
+        middle = (low + high) / 2
+        too_slow = _lambert_time(middle, geometry) > flight_time
+        low = np.where(too_slow, middle, low)
+        high = np.where(too_slow, high, middle)
+
+    x = (low + high) / 2
+    y = np.sqrt(1 - geometry**2 * (1 - x**2))
+    gamma = np.sqrt(MU * semiperimeter / 2)
+    rho = (r1 - r2) / chord
+    transverse = gamma * np.sqrt(np.maximum(0, 1 - rho**2)) * (y + geometry * x)
+    minus, plus = geometry * y - x, geometry * y + x
+    v1 = (gamma * (minus - rho * plus))[:, None] * radial1
+    v1 += transverse[:, None] * np.cross(aligned, radial1)
+    v2 = (-gamma * (minus + rho * plus))[:, None] * radial2
+    v2 += transverse[:, None] * np.cross(aligned, radial2)
+    return v1 / r1[:, None], v2 / r2
+
+
+def complete_last_two(start, times, first_four):
+    """Target the last coast with Lambert, then match the terminal velocity."""
     first_four = np.asarray(first_four)
     if first_four.ndim == 2:
         first_four = first_four[None]
@@ -130,28 +205,10 @@ def complete_last_two(start, times, first_four, initial=None):
         x = propagate(x, times[j+1] - times[j])
     endpoint = to_eci(GOAL, times[-1])
     dt = times[-1] - times[-2]
-    fifth = np.broadcast_to(np.zeros(3) if initial is None else initial, (len(x), 3)).copy()
-    for _ in range(7):
-        after = x.copy()
-        after[:, 3:] += fifth
-        end = propagate(after, dt)
-        miss = endpoint[:3] - end[:, :3]
-        if np.max(np.linalg.norm(miss, axis=1)) < 1e-4:
-            break
-        eps = .001
-        probes = np.repeat(after[:, None], 3, axis=1)
-        probes[:, np.arange(3), 3 + np.arange(3)] += eps
-        shifted = propagate(probes, dt)
-        jac = ((shifted[..., :3] - end[:, None, :3]) / eps).transpose(0, 2, 1)
-        try:
-            step = np.linalg.solve(jac, miss[..., None])[..., 0]
-        except np.linalg.LinAlgError:
-            step = np.linalg.lstsq(jac, miss[..., None], rcond=None)[0][..., 0]
-        fifth += np.clip(step, -10, 10)
-    after = x.copy()
-    after[:, 3:] += fifth
-    end = propagate(after, dt)
-    sixth = endpoint[3:] - end[:, 3:]
+    departure, arrival = _lambert_velocities(x[:, :3], endpoint[:3], dt)
+    fifth = departure - x[:, 3:]
+    sixth = endpoint[3:] - arrival
+    end = propagate(np.column_stack((x[:, :3], departure)), dt)
     burns = np.concatenate((first_four, fifth[:, None], sixth[:, None]), axis=1)
     return burns, np.linalg.norm(end[:, :3]-endpoint[:3], axis=1)
 
@@ -174,7 +231,7 @@ def trajectory(start, times, burns, samples):
 
 def nominal():
     times = np.linspace(0, TOF, 6)
-    burns, miss = complete_last_two(START, times, TABLE_BURNS[:4], TABLE_BURNS[4])
+    burns, miss = complete_last_two(START, times, TABLE_BURNS[:4])
     assert miss[0] < 1e-3
     path = trajectory(START, times, burns[0], GRID)
     assert np.linalg.norm(path[-1] - GOAL) < 1e-3
@@ -369,6 +426,14 @@ def generate(path, points=100, per_point=10, particles=16, iterations=20, seed=7
 
 
 def self_check():
+    # Circular transfers on either side of 180 degrees, plus the antipodal case.
+    initial = target(0)
+    for fraction in (.25, .5, .8):
+        duration = fraction * 2*np.pi/N
+        endpoint = target(duration)[0]
+        departure, arrival = _lambert_velocities(initial[0][None, :3], endpoint[:3], duration)
+        np.testing.assert_allclose(departure[0], initial[0][3:], rtol=0, atol=1e-6)
+        np.testing.assert_allclose(arrival[0], endpoint[3:], rtol=0, atol=1e-6)
     x = to_eci(START, 0)
     assert np.allclose(to_rel(x, 0), START, atol=1e-8)
     assert np.allclose(propagate(propagate(x, 1234), 4321), propagate(x, 5555), atol=1e-5)
